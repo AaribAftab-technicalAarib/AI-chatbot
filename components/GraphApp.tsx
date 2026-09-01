@@ -7,14 +7,21 @@ import { ErrorBanner } from "@/components/ErrorBanner";
 import { Graph } from "@/components/Graph";
 import { RangeControls } from "@/components/RangeControls";
 import { ThemeToggle } from "@/components/ThemeToggle";
-import { parseFormula } from "@/lib/parser";
-import { sampleCurves, type SampledCurve } from "@/lib/sampler";
+import { compile } from "@/lib/parser";
 import { autoYRange } from "@/lib/range";
 import { DEFAULT_RANGE, readStateFromSearch, writeStateToSearch } from "@/lib/share";
-import { downloadSvgAsPng } from "@/lib/png";
+import { sampleInWorker } from "@/lib/samplerClient";
+import type { SampledCurve } from "@/lib/sampler";
 import { cn } from "@/lib/cn";
 
 type Status = "idle" | "copied" | "error";
+
+type Computed = {
+  curves: SampledCurve[];
+  yMin: number;
+  yMax: number;
+  error: string | null;
+};
 
 export function GraphApp() {
   const initial = useMemo(() => {
@@ -32,34 +39,72 @@ export function GraphApp() {
   const [autoY, setAutoY] = useState<boolean>(initial.autoY);
   const [status, setStatus] = useState<Status>("idle");
   const [width, setWidth] = useState<number>(800);
-  const [renderTick, setRenderTick] = useState(0);
+  const [computed, setComputed] = useState<Computed>({
+    curves: [],
+    yMin: initial.y0,
+    yMax: initial.y1,
+    error: null,
+  });
   const wrapRef = useRef<HTMLDivElement>(null);
   const svgRef = useRef<SVGSVGElement | null>(null);
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const sampleDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const lastUrlRef = useRef<string>("");
-
-  const parseResult = useMemo(() => parseFormula(eq), [eq]);
-
-  const computed = useMemo(() => {
-    if (!parseResult.ok) {
-      return { curves: [] as SampledCurve[], yMin, yMax, error: parseResult.error };
-    }
-    if (xMax <= xMin) {
-      return { curves: [] as SampledCurve[], yMin, yMax, error: "x max must be greater than x min." };
-    }
-    const curves = sampleCurves(parseResult.curves, xMin, xMax);
-    let yLo = yMin;
-    let yHi = yMax;
-    if (autoY) {
-      const r = autoYRange(curves, xMin, xMax);
-      yLo = r.yMin;
-      yHi = r.yMax;
-    }
-    return { curves, yMin: yLo, yMax: yHi, error: null as string | null };
-  }, [parseResult, xMin, xMax, yMin, yMax, autoY]);
+  const reqIdRef = useRef<number>(0);
 
   useEffect(() => {
-    setRenderTick((t) => t + 1);
+    setXMin(initial.x0);
+    setXMax(initial.x1);
+    setYMin(initial.y0);
+    setYMax(initial.y1);
+    setAutoY(initial.autoY);
+    setEq(initial.eq);
+  }, [initial.eq, initial.x0, initial.x1, initial.y0, initial.y1, initial.autoY]);
+
+  useEffect(() => {
+    if (xMax <= xMin) {
+      setComputed({ curves: [], yMin, yMax, error: "x max must be greater than x min." });
+      return;
+    }
+    const equations = eq
+      .split(/[,\n]/)
+      .map((s) => s.trim())
+      .filter(Boolean);
+    if (equations.length === 0) {
+      setComputed({ curves: [], yMin, yMax, error: "Type a formula to get started." });
+      return;
+    }
+    for (const e of equations) {
+      const r = compile(e);
+      if (!r.ok) {
+        setComputed({ curves: [], yMin, yMax, error: r.error });
+        return;
+      }
+    }
+
+    if (sampleDebounceRef.current) clearTimeout(sampleDebounceRef.current);
+    sampleDebounceRef.current = setTimeout(() => {
+      const id = ++reqIdRef.current;
+      sampleInWorker(equations, xMin, xMax, 600).then((res) => {
+        if (id !== reqIdRef.current) return;
+        if (!res.ok) {
+          setComputed({ curves: [], yMin, yMax, error: res.error });
+          return;
+        }
+        let yLo = yMin;
+        let yHi = yMax;
+        if (autoY) {
+          const r2 = autoYRange(res.curves, xMin, xMax);
+          yLo = r2.yMin;
+          yHi = r2.yMax;
+        }
+        setComputed({ curves: res.curves, yMin: yLo, yMax: yHi, error: null });
+      });
+    }, 60);
+
+    return () => {
+      if (sampleDebounceRef.current) clearTimeout(sampleDebounceRef.current);
+    };
   }, [eq, xMin, xMax, yMin, yMax, autoY]);
 
   useEffect(() => {
@@ -124,7 +169,8 @@ export function GraphApp() {
     if (!svg) return;
     const filename = (eq.replace(/[^a-z0-9]+/gi, "_").slice(0, 40) || "graph") + ".png";
     try {
-      await downloadSvgAsPng(svg, filename);
+      const mod = await import("@/lib/png");
+      await mod.downloadSvgAsPng(svg, filename);
     } catch {
       setStatus("error");
       setTimeout(() => setStatus("idle"), 1600);
@@ -162,7 +208,6 @@ export function GraphApp() {
       >
         <div className="relative">
           <Graph
-            key={renderTick}
             ref={svgRef}
             curves={computed.curves}
             xMin={xMin}

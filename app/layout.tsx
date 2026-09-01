@@ -10,11 +10,13 @@ export const metadata: Metadata = {
     title: "Formula Graph",
     description: "Type a formula, get a graph. Share by link.",
     type: "website",
+    images: ["/og"],
   },
   twitter: {
     card: "summary_large_image",
     title: "Formula Graph",
     description: "Type a formula, get a graph.",
+    images: ["/og"],
   },
   icons: {
     icon: "/favicon.svg",
